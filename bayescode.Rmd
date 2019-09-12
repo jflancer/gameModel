@@ -1,0 +1,858 @@
+---
+title: "Bayesian Team Model"
+author: "Jake Flancer"
+date: "9/12/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# !diagnostics off
+knitr::opts_chunk$set(echo = TRUE)
+options(warn = -1) #Sim code produces many warnings
+
+library(ggridges)
+library(tidyverse)
+library(knitr)
+library(teamcolors)
+library(gganimate)
+
+# Load nhl game data downloaded from nhl.com as xml and parsed in separate script
+all_data <- read_csv("nhlgamedata.csv")
+
+# First find all OT games to remove those GF/GA from the column since sim should only use the 60 mins of scoring
+ot_games <- all_data %>%
+  filter(otLosses == 1) %>%
+  distinct(gameId) %>%
+  mutate(otWins = 1,
+         otLosses = 0)
+
+# Remove goals scored/allowed from all OT games
+# Add back goals for OT games that went to shootout, since that isn't included in GF/GA cols
+team_data <- left_join(all_data, ot_games,
+  by = c("gameId", "otLosses")) %>%
+  mutate(otWins = ifelse(is.na(otWins), 0, 1),
+         goalsFor = goalsFor - otWins + shootoutGamesWon,
+         goalsAgainst = goalsAgainst - otLosses + shootoutGamesLost
+         )
+
+# Get league scoring rates with OT removed
+league_rates <- team_data %>%
+  mutate(season = gameId %/%1000000) %>%
+  group_by(season) %>%
+  summarise(G = mean(goalsFor+goalsAgainst)/2)
+```
+
+
+
+```{r data prep, echo = FALSE}
+# Just get team mapping table
+team_table <- team_data %>%
+  distinct(teamAbbrev, teamFullName, teamId)
+
+goal_data <- team_data %>%
+  mutate(season = gameId %/%1000000) %>%
+  group_by(teamAbbrev, season) %>%
+  arrange(gameId) %>%
+  mutate(
+         GP = row_number()-1,
+         cGF = cumsum(goalsFor)-goalsFor,
+         cGA = cumsum(goalsAgainst)-goalsAgainst
+         ) %>%
+  select(season, gameDate, gameId, teamAbbrev, gameLocationCode, wins, otLosses, otWins, GP, goalsFor, cGF, goalsAgainst, cGA)
+```
+
+Show that goal scoring is approximately poisson
+
+```{r poisson check plot, include = FALSE, echo = FALSE}
+cur_data <- filter(goal_data, season == 2018)
+act_goals <- table(cur_data$goalsFor)
+exp_goals <- dpois(0:(length(act_goals)-1),mean(cur_data$goalsFor))*length(cur_data$goalsFor)
+
+pois_data <- data.frame(Goals = c(0:(length(act_goals)-1)),
+                  Frequency = as.numeric(act_goals),
+                  stringsAsFactors = F)
+exp_data <- data.frame(Goals = c(0:(length(act_goals)-1)),
+                  Frequency = as.numeric(exp_goals),
+                  stringsAsFactors = F)
+
+ggplot(pois_data, aes(Goals, Frequency)) +
+  geom_point(data = exp_data,
+             aes(Goals, Frequency, color = "Expectation")) +
+  geom_point(aes(color = "Observed")) +
+    geom_line(data = exp_data,
+             aes(Goals, Frequency, color = "Expectation")) +
+  geom_line(aes(color = "Observed")) +
+  ggtitle("2018-19 NHL Goals Per Game as Poisson", 
+          subtitle = paste("Drawing From Poisson With Rate:", round(mean(goal_data$goalsFor),3))) +
+  theme_classic() +
+  scale_x_continuous(breaks = 0:10)
+
+```
+
+```{r team example sim, echo = FALSE}
+n <- 100000
+gf_a <- rgamma(n, 5, 1)
+gf_b <- rgamma(n, 250, 50)
+
+data.frame(GF = c(gf_a, gf_b),
+                      Team = rep(c("A","B"), each = n)
+                      ) %>%
+  ggplot(aes(GF, fill = Team)) +
+  geom_density() +
+  theme_classic() +
+  labs(title = "Goals Per Game Parameter Comparison", subtitle = "Using Noninformative Gamma Prior", x = "Goals Per Game")
+```
+
+```{r create sim function, echo = FALSE}
+
+# prior_strength = Prior beta = Prior GP to add
+# nsim = Number of times sim is ran
+# seasonId = Season, using starting year (2018 = 2018-19)
+# prior_type = "league" starts all teams with a prior centered at the previous season's league average. "team" uses the team specific average weighted by an amount
+# weight = Amount of weight to give the team component of the prior. So 2/3 -> (2/3)*team + (1/3)*league
+
+run_sim <- function(prior_strength = 20, nsim = 1000, seasonId = 2018, prior_type = 'league', weight = 2/3){
+  # League average prior
+  if(prior_type == 'league' | seasonId <= 2008){
+    prior_data <- league_rates %>%
+      mutate(priorG = G * prior_strength) %>%
+      select(season, priorG)
+  
+    #Create updating posterior distribution
+    posterior_data <- goal_data %>%
+      left_join(prior_data, by = 'season') %>%
+      mutate(alphaGF = priorG + cGF, 
+             alphaGA = priorG + cGA,
+             beta = prior_strength + GP
+             )
+    # Team specific prior
+  } else {
+    prior_data <- goal_data %>%
+      group_by(teamAbbrev,season) %>%
+      summarise(GF = sum(goalsFor),
+                GA = sum(goalsAgainst),
+                GP = n()
+                ) %>%     
+      ungroup() %>%
+      mutate(season = season + 1) %>%
+      group_by(season) %>%
+        mutate(
+             # Use team specific prior
+             priorGF = (GF/GP) * prior_strength * weight + mean(GF)/mean(GP) * prior_strength *(1-weight),
+             priorGA = (GA/GP) * prior_strength * weight + mean(GA)/mean(GP) * prior_strength *(1-weight)
+             ) %>%
+      select(season, teamAbbrev, priorGF, priorGA) %>%
+      ungroup()
+
+    #Create posterior distribution
+    posterior_data <- goal_data %>%
+      filter(season > 2008) %>%
+      left_join(prior_data, by = c('season','teamAbbrev')) %>%
+      group_by(season) %>%
+      mutate(
+        # If team didn't exist (VGK) just use league average prior
+        priorGF = ifelse(is.na(priorGF), mean(priorGF,na.rm = T), priorGF),
+        priorGA = ifelse(is.na(priorGA), mean(priorGA,na.rm = T), priorGA),
+        alphaGF = priorGF + cGF,
+        alphaGA = priorGA + cGA,
+        beta = prior_strength + GP
+        )
+  }
+
+  away_team <- posterior_data %>%
+    ungroup() %>%
+    filter(gameLocationCode == "R") %>%
+    select(-gameLocationCode)
+  
+  # Turn into posterior predictive for game sims
+  all_data <- posterior_data %>%
+    ungroup() %>%
+    filter(gameLocationCode == "H") %>%
+    left_join(away_team, by = c('season','gameId','gameDate'), suffix = c('_H','_A')) %>%
+    select(season, gameDate, gameId, teamAbbrev_H, teamAbbrev_A, otLosses_H, otLosses_A, wins_H, 
+           goalsFor_H, goalsFor_A,
+           GP_H, GP_A,
+           alphaGF_H, alphaGA_H, beta_H,
+           alphaGF_A, alphaGA_A, beta_A
+           ) %>%
+    mutate(alpha_HomeScoring = alphaGF_H + alphaGA_A, #Game home team parameter
+           alpha_AwayScoring = alphaGF_A + alphaGA_H, #Game away team parameter
+            Beta_Game = beta_H + beta_A #Game beta parameter
+           ) %>%
+    select(-GP_H,-GP_A)
+  
+  game_data <- filter(all_data, season==seasonId)
+  
+  #Use predictive posterior for distribution of predicted scoring rate in a games
+  game_sims <- list()
+  talent_sims <- list()
+  game_data$xHome <- NA
+  game_data$xAway <- NA
+  game_data$xOT <- NA
+  game_data$wProb <- NA
+  game_data$lloss <- NA
+  
+  for(i in 1:nrow(game_data)){
+    # Get posterior samples for each team
+    talent_sims[[i]] <- list(HomeGF = rgamma(nsim, game_data$alphaGF_H[i], game_data$beta_H[i]),
+                             HomeGA = rgamma(nsim, game_data$alphaGA_H[i], game_data$beta_H[i]),
+                             AwayGF = rgamma(nsim, game_data$alphaGF_A[i], game_data$beta_A[i]),
+                             AwayGA = rgamma(nsim, game_data$alphaGA_A[i], game_data$beta_A[i])
+                             )
+  
+    # Sample from game parameters
+    HomeLambdas <- rgamma(nsim, game_data$alpha_HomeScoring[i], game_data$Beta_Game[i])
+    AwayLambdas <- rgamma(nsim, game_data$alpha_AwayScoring[i], game_data$Beta_Game[i])
+
+    # Simple home advantage -- assumes it has same affect on GF and GA... * 1.04 in an even game results in ~ 53% win percentage
+    multiplier <- 0.045 #* (1+(game_data$xwP[i]- 0.54)*2) # Old method
+
+    # Use game parameters to sample results
+    HomeScores <- rpois(nsim, HomeLambdas*(1+multiplier))
+    AwayScores <- rpois(nsim, AwayLambdas/(1+multiplier))
+
+    # Calculate expected scores, prob of OT, and win prob
+    game_sims[[i]] <- list(HomeScores,AwayScores)
+    game_data$xHome[i] <- mean(HomeScores)
+    game_data$xAway[i] <- mean(AwayScores)
+    game_data$xOT[i] <- sum(HomeScores==AwayScores)/nsim
+    game_data$wProb[i] <- (sum(HomeScores>AwayScores) + sum(HomeScores==AwayScores)*0.52)/nsim #Assuming OT as coin flip with slight home advantage
+    game_data$lloss[i] <- -1*(game_data$wins_H[i]*log(game_data$wProb[i]) +         
+                                (1-game_data$wins_H[i])*log(1-game_data$wProb[i]))
+  }
+  return(list(rename(game_data, "isWin" = "wins_H"), talent_sims, game_sims))
+}
+```
+
+```{r run function, echo = FALSE}
+# Run function on many different combinations
+runs <- data.frame(season = c(2014,2015,2016,2017,2017,2017,2017,2018,2018,2018,2018),
+                   prior = c("team","team","team","league","league","team","team","league","league","team","team"),
+                   strength = c(20,20,20,1,20,1,20,1,20,1,20),
+                   lloss = NA,
+                   base = NA
+                   )
+run_list <- list()
+for(i in 1:nrow(runs)){
+  sim_run <- run_sim(nsim = 2000, seasonId = runs$season[i], prior_type = runs$prior[i], prior_strength = runs$strength[i])
+
+  dataset <- sim_run[[1]]
+
+  runs$lloss[i] <- mean(dataset$lloss)
+  # Baseline log loss with naive predict home team 54% of time
+  runs$base[i] <- -mean(dataset$isWin*log(0.54) + (1-dataset$isWin)*log(0.46))
+
+  run_list[[i]] <- sim_run
+  print(i)
+}
+dataset <- run_list[[length(run_list)]][[1]]
+```
+
+Parameter distributions for every game for every team
+
+```{r master team plot, echo = FALSE}
+sim_run <- run_sim(nsim = 10000, seasonId = 2018, prior_type = "team", prior_strength = 20)
+# PLOT TAKES SOME TIME TO RENDER-- DONT SAVE UNLESS NEEDED
+talent_sims <- sim_run[[2]]
+game_data <- sim_run[[1]]
+
+size <- 2000
+temp1 <- lapply(talent_sims, function(x){
+  data.frame(Rate = c(x$HomeGF[1:size],x$HomeGA[1:size]),
+                      Class = c(rep('GF',size),rep('GA',size)))
+})
+home_rates <- bind_rows(temp1)
+home_rates$game <- rep(1:1271, each = size*2)
+home_rates$team = rep(game_data$teamAbbrev_H, each = size*2)
+
+temp2 <- lapply(talent_sims, function(x){
+  data.frame(Rate = c(x$AwayGF[1:size],x$AwayGA[1:size]),
+                      Class = c(rep('GF',size),rep('GA',size)))
+})
+away_rates <- bind_rows(temp2)
+away_rates$game <- rep(1:1271, each = size*2)
+away_rates$team = rep(game_data$teamAbbrev_A, each = size*2)
+
+team_rates <- rbind(home_rates,away_rates)
+
+game_numbs <- team_rates %>%
+  distinct(game,team) %>%
+  group_by(team) %>%
+  mutate(GameNumber = rank(game))
+
+team_rates <- team_rates %>%
+  left_join(game_numbs, by = c('game','team'))
+
+last_game <- team_rates %>%
+  filter(GameNumber==82) %>%
+  group_by(team,Class) %>%
+  summarise(Rate = mean(Rate)) %>%
+  spread(Class,Rate) %>%
+  mutate(Rating = GF-GA) %>%
+  arrange(desc(Rating))
+team_levels <- as.character(last_game$team)
+season <- first(sim_run[[1]]$season)
+
+# # Uncomment when actually creating or save or something
+# plot <- ggplot(team_rates, aes(x=Rate, y=as.factor(GameNumber))) +
+#   geom_density_ridges(aes(fill=as.character(Class)), color = 'white',
+#                       from = min(team_rates$Rate)-0.1, to = max(team_rates$Rate+0.1), alpha = 0.5,
+#                       scale = 11, size = 0.2, rel_min_height = 0.01) +
+#   facet_wrap(~factor(team, levels = team_levels)) +
+#   labs(
+#     x = "Goals Per Game",
+#     y = "Games Played",
+#     title = paste0(season, "-", season-1999," NHL Team Scoring Rate Distributions by Game"),
+#     fill = ""
+#   ) +
+#   scale_fill_manual(values = c('GF' = 'red','GA'='blue'),
+#                     labels = c('GF'='Goal For','GA'='Goals Against')) +
+#   theme_ridges(grid = FALSE) +
+#   theme(
+#     axis.text.y = element_text(size = 8,family = 'Helvetica'),
+#     plot.title = element_text(hjust = 0.75, family = 'Helvetica'),
+#     legend.text = element_text(family = 'Helvetica'),
+#     strip.background = element_rect(fill = NA),
+#     axis.text = element_text(family = 'Helvetica'),
+#     axis.title = element_text(face = "bold", size=11,family = 'Helvetica'),
+#     strip.text = element_text(family = 'Helvetica'),
+#     panel.border = element_rect(color = "black")
+#   ) +
+#   scale_y_discrete(breaks = c('1','41','82'))
+```
+
+Show Tampa Bay in 2018-19 for entire season
+
+```{r team season posterior flow, echo = FALSE}
+
+teamname <- "TBL"
+team <- team_table$teamFullName[match(teamname,team_table$teamAbbrev)]
+
+team_df <- team_rates %>% 
+  filter(team == teamname)
+
+ggplot(team_df, 
+       aes(x=Rate, y = as.factor(GameNumber), fill = Class)) +
+  geom_density_ridges(from = 1.5, to = 4.5, alpha = 0.5,
+                      scale = 12, size = 0.2, rel_min_height = 0.01) +
+  scale_fill_manual(values = c("red","blue"), 
+                     labels = c("GA","GF"),
+                     name = "Distribution"
+                     ) +
+  labs(
+    x = "Goals Per Game",
+    y = "Games Played",
+    title = paste("2018-19",team,"Scoring Rate Distribution"),
+    caption = "by Jake Flancer"
+  ) +
+  theme_ridges(grid = FALSE) +
+  theme(
+    plot.title = element_text(hjust = 0.75, family = 'Helvetica'),
+    plot.subtitle = element_text(hjust = 0.75, family = 'Helvetica'),
+    legend.text = element_text(family = 'Helvetica'),
+    axis.text = element_text(family = 'Helvetica'),
+    axis.title = element_text(size=11)) +
+  scale_y_discrete(breaks = c('1','41','82'))
+```
+
+Plot entire league learning
+
+Show with gp = 1, 82 to show prior/posterior for league
+
+```{r league game number plot, echo = FALSE}
+
+slice_plot <- function(gp){
+  
+# Get ratings for game selected
+specific_game <- team_rates %>% 
+    filter(GameNumber == gp) %>%
+    group_by(team,Class) %>%
+    mutate(Rating = mean(Rate)) %>%
+    group_by(team) %>%
+    do({mutate(., Rating = mean(.$Rating[which(.$Class=="GF")]) - mean(.$Rating[which(.$Class=="GA")]))}) %>%
+    arrange(desc(Rating))
+  
+# Merge in colors
+colors <- teamcolors %>%
+    left_join(team_table, by = c('name'='teamFullName')) %>%
+  filter(league == "nhl") %>%
+  mutate(display = ifelse(primary %in% c("#010101"),secondary,primary)
+         ) %>%
+  mutate_if(is.factor, as.character)
+
+colors <- colors[match(team_levels,colors$teamAbbrev),]
+vals <- colors$display
+names(vals) <- colors$teamAbbrev
+
+sub_text <- if(gp!=1) {
+  paste("Posterior Distributions For Game",gp)
+} else {
+  "Prior Distributions"
+}
+
+ggplot(specific_game, 
+       aes(x=Rate, fill = team, color = Class)) +
+  geom_density(alpha = 0.9
+                      ) +
+   scale_fill_manual(values = vals,
+                     guide = F
+                      ) +
+  scale_color_manual(values = c("black","white"), 
+                     labels = c("GA","GF"),
+                     name = "Distribution"
+                     ) +
+  labs(
+    x = "Goals Per Game",
+    y = "Games Played",
+    title = "2018-19 NHL Team Scoring Rate Distributions",
+    subtitle = sub_text,
+    caption = "by Jake Flancer"
+  ) +
+  facet_wrap(~reorder(team, -Rating)) +
+  theme_ridges(grid = FALSE) +
+  theme(
+    plot.title = element_text(hjust = 0.75, family = 'Helvetica'),
+    plot.subtitle = element_text(hjust = 0.75, family = 'Helvetica'),
+    legend.text = element_text(family = 'Helvetica'),
+    axis.text = element_text(family = 'Helvetica'),
+    axis.text.y = element_blank(),
+    axis.title.y = element_blank(),
+    axis.title = element_text(size=11)) +
+  xlim(c(1,5)) +
+  ylim(c(0,3))
+}
+```
+
+Preseason posterior distribution
+
+```{r preseason distribution results, echo = FALSE}
+slice_plot(1)
+```
+
+End of regular season posterior distribution
+
+```{r end of season distribution results, echo = FALSE}
+slice_plot(82)
+```
+
+
+```{r team comparison plot, echo = FALSE}
+gp = 82
+team1 = "BOS"
+team2 = "STL"
+rate = "GF"
+
+specific_game <- team_rates %>% 
+    filter(GameNumber == gp, team %in% c(team1,team2), Class == rate)
+  
+colors <- teamcolors %>%
+    left_join(team_table, by = c('name'='teamFullName')) %>%
+  filter(league == "nhl") %>%
+  mutate(display = ifelse(primary %in% c("#010101"),secondary,primary)
+         ) %>%
+  mutate_if(is.factor, as.character)
+
+colors <- colors[match(team_levels,colors$teamAbbrev),]
+vals <- colors$display
+names(vals) <- colors$teamAbbrev
+
+prob <- specific_game$Rate[which(specific_game$team==team1)] > specific_game$Rate[which(specific_game$team==team2)]
+prob <- sum(prob) / nrow(specific_game) * 200 #*2 because it makes nrow/2 comparisons
+
+sub_text <- paste0("Probability ", team1, " > ", team2, " = ", prob,"%")
+
+ggplot(specific_game, 
+       aes(x=Rate, fill = team)) +
+  geom_density(alpha = 0.9
+                      ) +
+   scale_fill_manual(values = vals,
+                     guide = F
+                      ) +
+  labs(
+    x = "Goals Per Game",
+    y = "Games Played",
+    title = paste0("2018-19 Game ", gp," NHL Team ", rate, "/GP Distributions"),
+    subtitle = sub_text,
+    caption = "by Jake Flancer"
+  ) +
+  theme_ridges(grid = FALSE) +
+  theme(
+    plot.title = element_text(hjust = 0.75, family = 'Helvetica'),
+    plot.subtitle = element_text(hjust = 0.75, family = 'Helvetica'),
+    legend.text = element_text(family = 'Helvetica'),
+    axis.text = element_text(family = 'Helvetica'),
+    axis.text.y = element_blank(),
+    axis.title.y = element_blank(),
+    axis.title = element_text(size=11))
+
+```
+
+Demonstration of difference between posterior for parameter vs. posterior predictive for actual outcomes
+
+```{r tbl game 82 investigation, echo = FALSE}
+
+gp <- 82
+
+specific_game <- team_rates %>% 
+  filter(GameNumber == gp,
+         team == teamname
+         ) %>%
+  mutate(team = factor(team, levels = team_levels))
+
+colors <- teamcolors::teamcolors %>%
+    left_join(team_table, by = c('name'='teamFullName')) %>%
+  filter(league == "nhl") %>%
+  mutate(display = ifelse(primary == "#010101",secondary,primary),
+         teamAbbrev = factor(teamAbbrev, levels = team_levels)
+         )
+
+colors <- colors[match(team_levels,colors$teamAbbrev),]
+
+plot1 <- ggplot(specific_game, 
+       aes(x=Rate, fill = team,color = Class)) +
+  geom_density(alpha = 0.75) +
+  xlim(2,4.5) +
+   scale_fill_manual(values = colors$display,
+                     labels = colors$teamAbbrev,
+                     guide = F
+                      ) +
+  scale_color_manual(values = c("black","white"), 
+                     labels = c("GA","GF"),
+                     name = "Distribution"
+                     ) +
+  labs(
+    x = "Goals Per Game",
+    title = paste("2018-19",team,"Scoring Rate Distributions for Game",gp),
+    subtitle = paste("Scoring Rate Posterior Distribution",gp),
+    caption = "by Jake Flancer"
+  ) +
+  theme_ridges(grid = FALSE) +
+  theme(
+    plot.title = element_text(hjust = 0.75, family = 'Helvetica'),
+    plot.subtitle = element_text(hjust = 0.75, family = 'Helvetica'),
+    legend.text = element_text(family = 'Helvetica'),
+    axis.text = element_text(family = 'Helvetica'),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.title.y = element_blank(),
+    axis.title = element_text(size=11))
+
+gf <- rpois(nrow(specific_game)/2, specific_game$Rate[which(specific_game$Class=="GF")])
+ga <- rpois(nrow(specific_game)/2, specific_game$Rate[which(specific_game$Class=="GA")])
+
+plot2 <- data.frame(Rate = c(gf,ga),
+                       Class = rep(c("GF","GA"), each = nrow(specific_game)/2)
+                       ) %>%
+  group_by(Rate,Class) %>%
+  summarise(Count = n()) %>%
+  ggplot(aes(Rate,Count, color = Class)) +
+  geom_point() +
+  geom_line() +
+  theme_classic() +
+  labs(x = "Simulated Goals",
+       title = paste("Simulated Goal Scoring vs. Non-Informative Opponent"),
+       subtitle = paste("Posterior Predictive Distribution for Game",gp)
+       ) +
+    theme(
+    plot.title = element_text(hjust = 0.5, family = 'Helvetica'),
+    plot.subtitle = element_text(hjust = 0.5, family = 'Helvetica'),
+    legend.text = element_text(family = 'Helvetica'),
+    axis.text = element_text(family = 'Helvetica'),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.title.y = element_blank(),
+    axis.title = element_text(size=11))
+
+df <- data.frame(Result = gf-ga) %>%
+  group_by(Result) %>%
+  summarise(Count = n())
+
+plot3 <-  ggplot(df, aes(Result,Count)) +
+  geom_point() +
+  geom_line() +
+  geom_vline(xintercept = weighted.mean(df$Result,df$Count), linetype = "dashed") +
+  theme_classic() +
+  labs(
+       title = paste("Simulated Goal Differential vs. Neutral Opponent"),
+    x = "Game Score Differential",
+    subtitle = paste("P(OT):",sum(gf==ga)/length(gf), "P(Win):", (sum(gf>ga)+0.5*sum(gf==ga))/length(gf), "E[GF-GA] = ",weighted.mean(df$Result,df$Count))
+  ) +
+  xlim(-12,12) +
+    theme(
+    plot.title = element_text(hjust = 0.5, family = 'Helvetica'),
+    plot.subtitle = element_text(hjust = 0.5, family = 'Helvetica'),
+    legend.text = element_text(family = 'Helvetica'),
+    axis.text = element_text(family = 'Helvetica'),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.title.y = element_blank(),
+    axis.title = element_text(size=11))
+
+gridExtra::grid.arrange(plot1,plot2,plot3, layout_matrix = rbind(c(1,1),c(2,3)), widths = c(2,2))
+```
+
+Using posterior predictive, we can simulate game outcomes. By simulating many times, we calculate the probability a team will win a game. We can use neutral opponent, like shown above or combine information from both teams. With both, we can denote $\alpha_{HGF},\alpha_{HGA},\alpha_{AGF},\alpha_{AGA},\beta_H,\beta_A$ where the parameters with a subscript $H$ denote the home team and $A$ denote the away team. $\alpha$ is the cumulative GF/GA for each team and $\beta$ is the total GP. We can then call $\beta = \beta_H + \beta_A = GF_H + GF_A$, $\alpha_H = \alpha_{HGF} + \alpha_{AGA} = HGF + AGA$, and $\alpha_A = \alpha_{AGF} + \alpha_{HGA} = AGF + HGA$. We can then draw scoring rates for $\lambda_H \sim Gamma(\alpha_H,\beta)$ and $\lambda_A \sim Gamma(\alpha_A,\beta)$. After adjusting for home advantage and rest (using simple multipliers found through regression/trial and error), we can use the scoring rate distributions to simulate $\text{Home Goals} \sim Poisson(\lambda_H)$ and $\text{Away Goals} \sim Poisson(\lambda_A)$. to find simulated game outcomes. To keep the model simple, and off of past research (cite), I found it best to flip a coin to determine OT winners.
+
+By running this model for each game, we have essentially created a very simple game probability model. To evaluate the effectiveness of the model, we will use log-loss (explain here). We can also vary the parameters to see whether or not they are effective. For example, we can change the prior from weakly informative to informative, and change whether we want to base off of the prior year league average or a weighted prior of league average and each team's past year performance.
+
+```{r log loss table, echo = FALSE}
+kable(runs)
+```
+
+Can now look further into the 18-19 team prior with a prior weight of 20 GP. Evaluate plot
+
+```{r log loss by time, include=FALSE, echo=FALSE}
+  ggplot(dataset,aes(gameDate, lloss)) +
+    geom_point(alpha=0.5) +
+    geom_smooth(span = 0.6, method = 'loess') +
+    geom_hline(yintercept = c(0.67,0.69)) +
+    scale_y_reverse()
+```
+
+Can also check how model is calibrated. Looking at this model and other results, it may suggest that the model underestimating particularly uneven matchups.
+
+```{r calibration testing, echo = FALSE}
+cal_data <- dataset %>%
+  select(isWin, wProb) %>%
+  mutate(
+    isWin = ifelse(wProb<0.5,1-isWin,isWin),
+    wProb = ifelse(wProb<0.5,1-wProb,wProb),
+    Bin = cut(wProb, breaks = seq(0.5,0.75,by = 0.025), include.lowest = T)) %>%
+  group_by(Bin) %>%
+  summarise(
+    GP = n(),
+    Wins = sum(isWin == 1),
+    Losses = sum(isWin == 0),
+    Actual_Win_Percentage = Wins/GP,
+    Model_Bin_Average = mean(wProb)
+  )
+kable(cal_data)
+```
+
+Explain that this model has many limitations and while it can be used as a simple way to make game predictions, it is much more effective as a way to demonstrate uncertainty and confidence in predictions.
+
+```{r season points distribution, echo=FALSE}
+sim_run <- run_sim(nsim = 4000, prior_strength = 20, prior_type = "team", weight = 2/3)
+game_sims <- sim_run[[3]]
+game_data <- sim_run[[1]]
+
+sim_game_results <- lapply(game_sims, function(x){
+    data.frame(Result=case_when(x[[1]]==x[[2]]~rbinom(1,1,.53)+0.5, x[[1]]>x[[2]]~2,x[[1]]<x[[2]]~0))
+})
+
+ot_percentage <- lapply(sim_game_results, function(x) {
+  sum(unlist(x) %in% c(0.5,1.5))/nrow(x)
+}) %>% unlist()
+mean(ot_percentage)
+
+result_df <- data.frame(sim_game_results)
+
+gf <- lapply(game_sims, function(x) x[[1]])
+gf <- data.frame(gf)
+ga <- lapply(game_sims, function(x) x[[2]])
+ga <- data.frame(ga)
+
+league_home_gf <- rowSums(gf)
+league_home_ga <- rowSums(ga)
+gf_pg <- (mean(league_home_gf) + mean(league_home_ga))/2 / ncol(gf) + mean(ot_percentage)
+
+season_results <- list()
+teams <- unique(game_data$teamAbbrev_H)
+
+for(i in 1:length(teams)) {
+  team <- teams[i]
+  home <- which(game_data$teamAbbrev_H == team)
+  hpts <- result_df[,home] %>%
+        mutate_all(~ case_when(. == 1.5 ~ 2,
+                             . == .5 ~ 1,
+                             T ~ .)
+                   ) %>%
+    rowSums()
+
+  away <- which(game_data$teamAbbrev_A == team)
+  apts <- result_df[,away] %>%
+        mutate_all(~ case_when(. == 1.5 ~ 1,
+                             . == .5 ~ 2,
+                             T ~ 2-.)
+                   ) %>%
+    rowSums()
+  
+  
+  
+  xPTS <- sum(c(game_data$wProb[home],(1-game_data$wProb[away])))*2
+  
+  actualGF <- sum(game_data$goalsFor_H[home] + game_data$goalsFor_A[away] + game_data$otLosses_A[home] + game_data$otLosses_H[away])
+  actualGA <- sum(game_data$goalsFor_A[home] + game_data$goalsFor_H[away] + game_data$otLosses_A[away] + game_data$otLosses_H[home])
+  
+  gf_team <- rowSums(gf[,home]) + rowSums(ga[,away])
+  ga_team <- rowSums(ga[,home]) + rowSums(gf[,away])
+  
+  season_results[[i]] <- data.frame(Team = teams[i],
+                                    PTS = hpts + apts,
+                                    xPTS = xPTS,
+                                    GF = gf_team,
+                                    GA = ga_team,
+                                    actualGF = actualGF,
+                                    actualGA = actualGA,
+                                    actualW = sum(game_data$isWin[home] + (1-game_data$isWin[away])) - (sum(game_data$otLosses_H[away] + game_data$otLosses_A[home])),
+                                    actualL = sum(game_data$isWin[away] + (1-game_data$isWin[home])) - (sum(game_data$otLosses_H[home] + game_data$otLosses_A[away])),
+                                    actualOTW = sum(game_data$otLosses_H[away] + game_data$otLosses_A[home]),
+                                    actualOTL = sum(game_data$otLosses_H[home] + game_data$otLosses_A[away]),
+                                    stringsAsFactors = F
+                                    ) %>%
+    mutate(actualPTS = (actualW + actualOTW)*2 + actualOTL)
+}
+
+season_stats <- season_results %>%
+  bind_rows() %>% 
+  mutate(Team = reorder(Team, -xPTS))
+
+season_projection <- season_stats %>% 
+  group_by(Team) %>% 
+  summarise(xPTS = mean(xPTS),
+            simPTS = mean(PTS),
+            simGF = mean(GF),
+            simGA = mean(GA),
+            actualGF = mean(actualGF),
+            actualGA = mean(actualGA),
+            actualW = mean(actualW),
+            actualL = mean(actualL),
+            actualOTW = mean(actualOTW),
+            actualOTL = mean(actualOTL),
+            actualPTS = (actualW + actualOTW)*2 + actualOTL
+            )
+
+ggplot(season_projection, aes(simPTS, actualPTS)) +
+  geom_label(aes(label = Team)) +
+  geom_abline(slope = 1, intercept = 0)+
+  xlim(60, 130) + 
+  ylim(60,130)
+
+ggplot(season_stats, aes(PTS)) +
+  geom_density() +
+  geom_vline(aes(xintercept = actualPTS), color = 'red') +
+  # geom_label(data = season_projection),
+  #            aes(x=xPTS,y=0.02, label = round(xPTS))
+  #            ) +
+  facet_wrap(.~Team) +
+  theme_classic() +
+    theme(axis.text.y = element_blank(),
+        axis.title.y = element_blank(),
+        axis.ticks.y = element_blank()
+        )
+```
+
+```{r View Individual Game Prediction}
+n <- 1270
+game_sum <- dataset[n,]
+rates <- sim_run[[3]][[n]]
+gf <- rates[[1]]
+ga <- rates[[2]]
+date <- substr(game_sum$gameDate[1],1,10)
+home <- game_sum$teamAbbrev_H[1]
+away <- game_sum$teamAbbrev_A[1]
+
+sim_data <- data.frame(Rate = c(gf,ga),
+                       Class = rep(c("Home","Away"), each = nrow(specific_game)/2)
+                       )
+prob_win <- (sum(gf>ga) + sum(gf==ga)*.52) / length(gf)
+prob_ot <- sum(gf==ga)/length(gf)
+xg_h <- mean(gf)
+xg_a <- mean(ga)
+
+sim_data %>%
+  group_by(Rate,Class) %>%
+  summarise(Count = n()) %>%
+  ggplot(aes(Rate,Count, fill = Class)) +
+  geom_col(position = "dodge") +
+  # geom_line() +
+  theme_classic() +
+  labs(x = "Simulated Goals",
+       title = paste(length(gf), "Simulations of", date, away, "at", home, "Goal Scoring"),
+       subtitle = paste0("P(Home Win) = ", round(prob_win*100), "%",
+                        "\nP(OT) = ", round(prob_ot*100), "%", 
+                        "\nxG Home = ", round(xg_h,2),
+                        "\nxG Away = ", round(xg_a,2)
+                        ),
+       fill = "Team"
+       ) +
+    theme(
+    plot.title = element_text(family = 'Helvetica'),
+    plot.subtitle = element_text(family = 'Helvetica'),
+    legend.text = element_text(family = 'Helvetica'),
+    axis.text = element_text(family = 'Helvetica'),
+    axis.title = element_text(size=11))
+
+dif_data <- data.frame(Rate = gf-ga)
+
+dif_data %>%
+  ggplot(aes(Rate)) +
+  geom_bar() +
+  theme_classic() +
+  labs(x = "Goal Differential",
+       title = paste(length(gf), "Simulations of", date, away, "at", home, "Goal Scoring"),
+       subtitle = paste0("P(Home Win) = ", round(prob_win*100), "%",
+                        "\nP(OT) = ", round(prob_ot*100), "%", 
+                        "\nxG Home = ", round(xg_h,2),
+                        "\nxG Away = ", round(xg_a,2)
+                        ),
+       fill = "Team"
+       ) +
+    theme(
+    plot.title = element_text(family = 'Helvetica'),
+    plot.subtitle = element_text(family = 'Helvetica'),
+    legend.text = element_text(family = 'Helvetica'),
+    axis.text = element_text(family = 'Helvetica'),
+    axis.title = element_text(size=11))
+
+```
+
+```{r GOTTA GIF EVERYTHING, echo = FALSE}
+  
+specific_game <- team_rates %>%
+  group_by(team,Class, game) %>%
+  sample_n(200) %>%
+  ungroup() %>%
+  filter(Class == "GF")
+  
+colors <- teamcolors %>%
+    left_join(team_table, by = c('name'='teamFullName')) %>%
+  filter(league == "nhl") %>%
+  mutate(display = ifelse(primary %in% c("#010101"),secondary,primary)
+         ) %>%
+  mutate_if(is.factor, as.character)
+
+colors <- colors[match(team_levels,colors$teamAbbrev),]
+vals <- colors$display
+names(vals) <- colors$teamAbbrev
+
+ggplot(specific_game, 
+       aes(x=Rate, fill = team)) +
+  geom_density(alpha = 0.9
+                      ) +
+  scale_fill_manual(values = vals,
+                     guide = F
+                      ) +
+  labs(
+    x = "Goals Per Game",
+    y = "Games Played",
+    title = "2018-19 NHL Team Goal Scoring Rate Distributions",
+    subtitle = "Posterior Distributions For Game {frame_time}",
+    caption = "by Jake Flancer"
+  ) +
+  facet_wrap(~team) +
+  theme_ridges(grid = FALSE) +
+  theme(
+    plot.title = element_text(hjust = 0.75, family = 'Helvetica'),
+    plot.subtitle = element_text(hjust = 0.75, family = 'Helvetica'),
+    legend.text = element_text(family = 'Helvetica'),
+    axis.text = element_text(family = 'Helvetica'),
+    axis.text.y = element_blank(),
+    axis.title.y = element_blank(),
+    axis.title = element_text(size=11)) +
+  xlim(c(1,5)) +
+  ylim(c(0,3)) +
+  # Comment this out since it takes A WHILE
+  # transition_time(GameNumber) +
+  NULL
+```
